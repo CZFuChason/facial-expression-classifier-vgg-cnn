@@ -1,0 +1,278 @@
+import tensorflow as tf
+import numpy as np
+import os
+ 
+def get_files(path_pos,path_neg,label_pos,label_neg):
+ 
+    TC = []
+    label_TC = []
+    nonTC = []
+    label_nonTC = []
+    # data loader
+    file_dir_TC=path_pos
+    file_dir_nonTC=path_neg
+    for file in os.listdir(file_dir_TC):
+        name = file.split('_')
+        if name[0] == label_pos:
+            TC.append(file_dir_TC + file)
+            label_TC.append(1)
+    for file in os.listdir(file_dir_nonTC):
+        name = file.split('_')
+        if name[0] == label_neg:
+            nonTC.append(file_dir_nonTC + file)
+            label_nonTC.append(0)
+    print("There are %d TC\nThere are %d nonTC" % (len(TC), len(nonTC)))
+ 
+    # shuffle
+    image_list = np.hstack((TC, nonTC))
+    label_list = np.hstack((label_TC, label_nonTC))
+    temp = np.array([image_list, label_list])
+    temp = temp.transpose()     # 转置
+    np.random.shuffle(temp)
+ 
+    image_list = list(temp[:, 0])
+    label_list = list(temp[:, 1])
+    label_list = [int(i) for i in label_list]
+ 
+    return image_list, label_list
+ 
+# img_list,label_list = get_files(file_dir)
+ 
+# batch
+def get_batch(image, label, image_W, image_H, batch_size, capacity):   
+    image = tf.cast(image, tf.string)
+    label = tf.cast(label, tf.int32)
+ 
+    # queue
+    input_queue = tf.train.slice_input_producer([image, label])
+ 
+    image_contents = tf.read_file(input_queue[0])
+    label = input_queue[1]
+    image = tf.image.decode_jpeg(image_contents, channels=1)
+ 
+    # resize
+    image = tf.image.resize_images(image, [image_H, image_W], method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    image = tf.cast(image, tf.float32)
+    # image = tf.image.per_image_standardization(image)   # 标准化数据
+    image_batch, label_batch = tf.train.batch([image, label],
+                                              batch_size=batch_size,
+                                              num_threads=64,   # 线程
+                                              capacity=capacity)
+  
+    return image_batch, label_batch
+    
+import tensorflow as tf
+def inference(images, batch_size, n_classes):
+ 
+ 
+    with tf.variable_scope('conv1') as scope:
+        weights = tf.get_variable('weights',
+                                  shape=[3, 3, 1, 16],
+                                  dtype=tf.float32,
+                                  initializer=tf.truncated_normal_initializer(stddev=0.1, dtype=tf.float32))
+        biases = tf.get_variable('biases',
+                                 shape=[16],
+                                 dtype=tf.float32,
+                                 initializer=tf.constant_initializer(0.1))
+        conv = tf.nn.conv2d(images, weights, strides=[1, 1, 1, 1], padding='SAME')
+        pre_activation = tf.nn.bias_add(conv, biases)
+        conv1 = tf.nn.relu(pre_activation, name=scope.name)
+ 
+    with tf.variable_scope('pooling1_lrn') as scope:
+            pool1 = tf.nn.max_pool(conv1, ksize=[1, 3, 3, 1], strides=[1, 2, 2, 1], padding='SAME', name='pooling1')
+            norm1 = tf.nn.lrn(pool1, depth_radius=4, bias=1.0, alpha=0.001 / 9.0, beta=0.75, name='norm1')
+ 
+    with tf.variable_scope('conv2') as scope:
+                weights = tf.get_variable('weights',
+                                          shape=[3, 3, 16, 16],
+                                          dtype=tf.float32,
+                                          initializer=tf.truncated_normal_initializer(stddev=0.1, dtype=tf.float32))
+                biases = tf.get_variable('biases',
+                                         shape=[16],
+                                         dtype=tf.float32,
+                                         initializer=tf.constant_initializer(0.1))
+                conv = tf.nn.conv2d(norm1, weights, strides=[1, 1, 1, 1], padding='SAME')
+                pre_activation = tf.nn.bias_add(conv, biases)
+                conv2 = tf.nn.relu(pre_activation, name='conv2')
+ 
+    # pool2 and norm2
+    with tf.variable_scope('pooling2_lrn') as scope:
+        norm2 = tf.nn.lrn(conv2, depth_radius=4, bias=1.0, alpha=0.001 / 9.0, beta=0.75, name='norm2')
+        pool2 = tf.nn.max_pool(norm2, ksize=[1, 3, 3, 1], strides=[1, 1, 1, 1], padding='SAME', name='pooling2')
+ 
+    with tf.variable_scope('local3') as scope:
+        reshape = tf.reshape(pool2, shape=[batch_size, -1])
+        dim = reshape.get_shape()[1].value
+        weights = tf.get_variable('weights',
+                                  shape=[dim, 128],
+                                  dtype=tf.float32,
+                                  initializer=tf.truncated_normal_initializer(stddev=0.005, dtype=tf.float32))
+        biases = tf.get_variable('biases',
+                                 shape=[128],
+                                 dtype=tf.float32,
+                                 initializer=tf.constant_initializer(0.1))
+    local3 = tf.nn.relu(tf.matmul(reshape, weights) + biases, name=scope.name)
+ 
+    # local4
+    with tf.variable_scope('local4') as scope:
+        weights = tf.get_variable('weights',
+                                  shape=[128, 128],
+                                  dtype=tf.float32,
+                                  initializer=tf.truncated_normal_initializer(stddev=0.005, dtype=tf.float32))
+        biases = tf.get_variable('biases',
+                                 shape=[128],
+                                 dtype=tf.float32,
+                                 initializer=tf.constant_initializer(0.1))
+        local4 = tf.nn.relu(tf.matmul(local3, weights) + biases, name='local4')
+ 
+    # softmax
+    with tf.variable_scope('softmax_linear') as scope:
+        weights = tf.get_variable('softmax_linear',
+                                  shape=[128, n_classes],
+                                  dtype=tf.float32,
+                                  initializer=tf.truncated_normal_initializer(stddev=0.005, dtype=tf.float32))
+        biases = tf.get_variable('biases',
+                                 shape=[n_classes],
+                                 dtype=tf.float32,
+                                 initializer=tf.constant_initializer(0.1))
+        softmax_linear = tf.add(tf.matmul(local4, weights), biases, name='softmax_linear')
+ 
+    return softmax_linear
+ 
+ 
+ 
+def losses(logits, labels, name):
+    with tf.variable_scope('loss') as scope:
+        cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits \
+            (logits=logits, labels=labels, name='xentropy_per_example')
+        loss = tf.reduce_mean(cross_entropy, name='loss')
+        if name=='train':
+            tf.summary.scalar(scope.name + '/train_loss', loss)
+        if name=='valid':
+            tf.summary.scalar(scope.name + '/valid_loss', loss)
+    return loss
+ 
+def trainning(loss, learning_rate):
+    with tf.name_scope('optimizer'):
+        optimizer = tf.train.AdamOptimizer(learning_rate= learning_rate)
+        global_step = tf.Variable(0, name='global_step', trainable=False)
+        train_op = optimizer.minimize(loss, global_step= global_step)
+    return train_op
+ 
+def evaluation(logits, labels, name):
+    with tf.variable_scope('accuracy') as scope:
+        correct = tf.nn.in_top_k(logits, labels, 1)
+        correct = tf.cast(correct, tf.float16)
+        accuracy = tf.reduce_mean(correct)
+        if name=='train':
+            tf.summary.scalar(scope.name + '/train_accuracy', accuracy)
+        if name=='valid':
+            tf.summary.scalar(scope.name + '/valid_accuracy', accuracy)
+    return accuracy
+
+def recall_precision(logits, labels, name):
+    predict = tf.arg_max(logits,1)
+    #logits = tf.cast(logits, tf.int32)
+    with tf.variable_scope('recall_precisio') as scope:
+        TP = tf.count_nonzero(predict * labels)
+        TN = tf.count_nonzero((predict - 1) * (labels - 1))
+        FP = tf.count_nonzero(predict * (labels - 1))
+        FN = tf.count_nonzero((predict - 1) * labels)
+        precision = tf.divide(TP, TP + FP)
+        recall = tf.divide(TP, TP + FN)
+        #f1 = 2 * precision * recall / (precision + recall)
+        if name=='train':
+            tf.summary.scalar(scope.name + '/train_precision', precision)
+            tf.summary.scalar(scope.name + '/train_recall', recall)
+        if name=='valid':
+            tf.summary.scalar(scope.name + '/valid_precision', precision)
+            tf.summary.scalar(scope.name + '/valid_recall', recall)
+    return precision, recall
+    
+import os
+import numpy as np
+import tensorflow as tf
+tf.reset_default_graph()
+N_CLASSES = 2 
+IMG_W = 32  # resize
+IMG_H = 32
+BATCH_SIZE = 64
+CAPACITY = 2000
+MAX_STEP = 5000000 
+learning_rate = 0.0001 
+ 
+train_dir = './train_merge/'
+logs_train_dir = './train_merge/'
+
+file_dir_TC='/home/ubuntu/data/TC/'
+file_dir_nonTC='/home/ubuntu/data/nonTC/'
+file_dir_valTC='/home/ubuntu/data/valTC/'
+file_dir_valnonTC='/home/ubuntu/data/valnonTC/'
+
+train, train_label = get_files(file_dir_TC,file_dir_nonTC,'TC','nonTC')
+valid, valid_label = get_files(file_dir_valTC,file_dir_valnonTC,'valTC','valnonTC')
+train_batch,train_label_batch=get_batch(train,
+                                train_label,
+                                IMG_W,
+                                IMG_H,
+                                BATCH_SIZE,
+                                CAPACITY)
+
+valid_batch,valid_label_batch=get_batch(valid,
+                                valid_label,
+                                IMG_W,
+                                IMG_H,
+                                BATCH_SIZE,
+                                CAPACITY)
+x = tf.placeholder(tf.float32, [BATCH_SIZE,IMG_W,IMG_H,1])
+y = tf.placeholder(tf.float32, [BATCH_SIZE])
+y = tf.cast(y,tf.int64)
+
+train_logits = inference(x, BATCH_SIZE, N_CLASSES)
+train_loss = losses(train_logits, y, 'train')
+valid_loss = losses(train_logits, y, 'valid')
+train_op = trainning(train_loss, learning_rate)
+train__acc = evaluation(train_logits, y, 'train')
+valid__acc = evaluation(train_logits, y, 'valid')
+tra_recall, tra_precision = recall_precision(train_logits, y, 'train')
+val_recall, val_precision = recall_precision(train_logits, y, 'valid')
+summary_op = tf.summary.merge_all() 
+ 
+sess = tf.Session()
+
+train_writer = tf.summary.FileWriter(logs_train_dir, sess.graph)
+
+saver = tf.train.Saver()
+
+sess.run(tf.global_variables_initializer())
+ 
+
+coord = tf.train.Coordinator()
+threads = tf.train.start_queue_runners(sess=sess, coord=coord)
+ 
+try:
+   
+    for step in np.arange(MAX_STEP):
+        if coord.should_stop():
+                break
+       
+        _, tra_loss, tra_acc, tra_recall, tra_precision= sess.run([train_op, train_loss, train__acc, tra_recall, tra_precision], feed_dict={x:train_batch,y:train_label_batch})
+        
+        if step % 50 == 0:
+            print('Step %d, train loss = %.2f, train accuracy = %.2f%%, train recall = %.2f%%, train precision = %.2f%%' %(step, tra_loss, tra_acc*100.0, tra_recall*100.0, tra_precision*100.0))
+            
+        if step % 200 == 0:    
+            val_loss, val_acc, cal_recall, val_precision = sess.run([valid_loss, valid__acc, val_recall, val_precision], feed_dict={x:valid_batch,y:valid_label_batch})
+            print('Step %d, valid loss = %.2f, valid accuracy = %.2f%%, valid recall = %.2f%%, valid precision = %.2f%%' %(step, val_loss, val_acc*100.0, val_recall*100.0, val_precision*100.0))
+            summary_str = sess.run(summary_op)
+            train_writer.add_summary(summary_str, step)
+      
+        if step % 2000 == 0 or (step + 1) == MAX_STEP:
+            checkpoint_path = os.path.join(logs_train_dir, 'model.ckpt')
+            saver.save(sess, checkpoint_path, global_step=step)
+
+except tf.errors.OutOfRangeError:
+    print('Done training -- epoch limit reached')
+
+finally:
+    coord.request_stop()
